@@ -73,6 +73,9 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         float height_min = yaml["roi"]["height_min"].as<float>();
 
         preprocess_->SetHeightROI(height_max, height_min);
+        if (yaml["roi"]["range_max"]) {
+            preprocess_->SetRangeROI(yaml["roi"]["range_max"].as<float>());
+        }
 
         options_.kf_dis_th_ = yaml["fasterlio"]["kf_dis_th"].as<double>();
         options_.kf_angle_th_ = yaml["fasterlio"]["kf_angle_th"].as<double>() * M_PI / 180.0;
@@ -83,6 +86,21 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         bool use_imu_filter = yaml["fasterlio"]["imu_filter"].as<bool>();
         p_imu_->SetUseIMUFilter(use_imu_filter);
         options_.proj_kfs_ = yaml["fasterlio"]["proj_kfs"].as<bool>();
+        imu_acc_input_scale_ =
+            yaml["fasterlio"]["imu_acc_scale"] ? yaml["fasterlio"]["imu_acc_scale"].as<double>() : 1.0;
+        imu_gyr_input_scale_ =
+            yaml["fasterlio"]["imu_gyr_scale"] ? yaml["fasterlio"]["imu_gyr_scale"].as<double>() : 1.0;
+        require_imu_init_before_lidar_ = yaml["fasterlio"]["require_imu_init_before_lidar"]
+                                             ? yaml["fasterlio"]["require_imu_init_before_lidar"].as<bool>()
+                                             : false;
+        imu_init_min_duration_ = yaml["fasterlio"]["imu_init_min_duration"]
+                                     ? yaml["fasterlio"]["imu_init_min_duration"].as<double>()
+                                     : 1.0;
+        imu_init_lidar_delay_ =
+            yaml["fasterlio"]["imu_init_lidar_delay"] ? yaml["fasterlio"]["imu_init_lidar_delay"].as<double>() : 0.15;
+        const bool gravity_align_input =
+            yaml["fasterlio"]["gravity_align_input"] ? yaml["fasterlio"]["gravity_align_input"].as<bool>() : false;
+        p_imu_->SetGravityAlignInput(gravity_align_input);
 
     } catch (...) {
         LOG(ERROR) << "bad conversion";
@@ -102,6 +120,9 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
     } else if (lidar_type == 4) {
         preprocess_->SetLidarType(LidarType::ROBOSENSE);
         LOG(INFO) << "Using RoboSense Lidar";
+    } else if (lidar_type == 5) {
+        preprocess_->SetLidarType(LidarType::JT128);
+        LOG(INFO) << "Using Hesai JT128 Lidar";
     } else {
         LOG(WARNING) << "unknown lidar_type";
         return false;
@@ -130,6 +151,8 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
     p_imu_->SetAccCov(Vec3d(acc_cov, acc_cov, acc_cov));
     p_imu_->SetGyrBiasCov(Vec3d(b_gyr_cov, b_gyr_cov, b_gyr_cov));
     p_imu_->SetAccBiasCov(Vec3d(b_acc_cov, b_acc_cov, b_acc_cov));
+    LOG(INFO) << "imu input scale acc: " << imu_acc_input_scale_ << ", gyr: " << imu_gyr_input_scale_
+              << ", require imu init before lidar: " << require_imu_init_before_lidar_;
     return true;
 }
 
@@ -138,10 +161,51 @@ LaserMapping::LaserMapping(Options options) : options_(options) {
     p_imu_.reset(new ImuProcess());
 }
 
+IMUPtr LaserMapping::ScaleIMU(const IMUPtr &imu) const {
+    if (!imu) {
+        return imu;
+    }
+
+    auto scaled = std::make_shared<IMU>(*imu);
+    scaled->linear_acceleration *= imu_acc_input_scale_;
+    scaled->angular_velocity *= imu_gyr_input_scale_;
+    return scaled;
+}
+
+void LaserMapping::DropBufferedIMUBefore(double timestamp) {
+    while (!imu_buffer_.empty() && imu_buffer_.front()->timestamp <= timestamp) {
+        imu_buffer_.pop_front();
+    }
+}
+
+bool LaserMapping::TryInitIMUBeforeLidar(double current_imu_time) {
+    if (!require_imu_init_before_lidar_ || p_imu_->IsIMUInited() || first_lidar_time_for_imu_init_ < 0.0) {
+        return false;
+    }
+
+    if (current_imu_time <= first_lidar_time_for_imu_init_ + imu_init_lidar_delay_) {
+        return false;
+    }
+
+    if (!p_imu_->TryInitFromIMU(imu_buffer_, kf_, imu_init_min_duration_)) {
+        return false;
+    }
+
+    kf_imu_ = kf_;
+    DropBufferedIMUBefore(current_imu_time);
+    LOG(INFO) << "IMU initialized before accepting LiDAR, first lidar: " << std::setprecision(14)
+              << first_lidar_time_for_imu_init_ << ", imu: " << current_imu_time;
+    return true;
+}
+
 void LaserMapping::ProcessIMU(const lightning::IMUPtr &imu) {
     publish_count_++;
 
-    double timestamp = imu->timestamp;
+    auto scaled_imu = ScaleIMU(imu);
+    if (!scaled_imu) {
+        return;
+    }
+    double timestamp = scaled_imu->timestamp;
 
     UL lock(mtx_buffer_);
     if (timestamp < last_timestamp_imu_) {
@@ -151,7 +215,9 @@ void LaserMapping::ProcessIMU(const lightning::IMUPtr &imu) {
 
     if (p_imu_->IsIMUInited()) {
         /// 更新最新imu状态
-        kf_imu_.Predict(timestamp - last_timestamp_imu_, p_imu_->Q_, imu->angular_velocity, imu->linear_acceleration);
+        auto corrected_imu = p_imu_->CorrectIMU(scaled_imu);
+        kf_imu_.Predict(timestamp - last_timestamp_imu_, p_imu_->Q_, corrected_imu->angular_velocity,
+                        corrected_imu->linear_acceleration);
 
         // LOG(INFO) << "newest wrt lidar: " << timestamp - kf_.GetX().timestamp_;
 
@@ -163,7 +229,8 @@ void LaserMapping::ProcessIMU(const lightning::IMUPtr &imu) {
 
     last_timestamp_imu_ = timestamp;
 
-    imu_buffer_.emplace_back(imu);
+    imu_buffer_.emplace_back(scaled_imu);
+    TryInitIMUBeforeLidar(timestamp);
 }
 
 bool LaserMapping::Run() {
@@ -313,7 +380,8 @@ bool LaserMapping::Run() {
         double t = measures_.imu_.back()->timestamp;
         for (auto &imu : imu_buffer_) {
             double dt = imu->timestamp - t;
-            kf_imu_.Predict(dt, p_imu_->Q_, imu->angular_velocity, imu->linear_acceleration);
+            auto corrected_imu = p_imu_->CorrectIMU(imu);
+            kf_imu_.Predict(dt, p_imu_->Q_, corrected_imu->angular_velocity, corrected_imu->linear_acceleration);
             t = imu->timestamp;
         }
     }
@@ -420,11 +488,21 @@ void LaserMapping::ProcessPointCloud2(const sensor_msgs::msg::PointCloud2::Share
                 return;
             }
 
+            if (require_imu_init_before_lidar_ && !p_imu_->IsIMUInited()) {
+                if (first_lidar_time_for_imu_init_ < 0.0) {
+                    first_lidar_time_for_imu_init_ = timestamp;
+                }
+                LOG_EVERY_N(INFO, 20) << "Waiting for IMU initialization before accepting JT128 LiDAR frames.";
+                last_timestamp_lidar_ = timestamp;
+                return;
+            }
+
             LOG(INFO) << "get cloud at " << std::setprecision(14) << timestamp
                       << ", latest imu: " << last_timestamp_imu_;
 
             CloudPtr cloud(new PointCloudType());
             preprocess_->Process(msg, cloud);
+            cloud = p_imu_->CorrectCloud(cloud);
 
             lidar_buffer_.push_back(cloud);
             time_buffer_.push_back(timestamp);
@@ -449,6 +527,7 @@ void LaserMapping::ProcessPointCloud2(const livox_ros_driver2::msg::CustomMsg::S
 
             CloudPtr cloud(new PointCloudType());
             preprocess_->Process(msg, cloud);
+            cloud = p_imu_->CorrectCloud(cloud);
 
             lidar_buffer_.push_back(cloud);
             time_buffer_.push_back(timestamp);
@@ -469,7 +548,16 @@ void LaserMapping::ProcessPointCloud2(CloudPtr cloud) {
                 lidar_buffer_.clear();
             }
 
-            lidar_buffer_.push_back(cloud);
+            if (require_imu_init_before_lidar_ && !p_imu_->IsIMUInited()) {
+                if (first_lidar_time_for_imu_init_ < 0.0) {
+                    first_lidar_time_for_imu_init_ = timestamp;
+                }
+                LOG_EVERY_N(INFO, 20) << "Waiting for IMU initialization before accepting JT128 LiDAR frames.";
+                last_timestamp_lidar_ = timestamp;
+                return;
+            }
+
+            lidar_buffer_.push_back(p_imu_->CorrectCloud(cloud));
             time_buffer_.push_back(timestamp);
             last_timestamp_lidar_ = timestamp;
         },

@@ -141,6 +141,9 @@ class LaserMapping {
 
     /// 将附近的关键帧投影至cloud中
     void ProjectKFs(CloudPtr cloud, int size_limit = 1000);
+    IMUPtr ScaleIMU(const IMUPtr &imu) const;
+    bool TryInitIMUBeforeLidar(double current_imu_time);
+    void DropBufferedIMUBefore(double timestamp);
 
    private:
     Options options_;
@@ -191,6 +194,12 @@ class LaserMapping {
     /// options
     bool keep_first_imu_estimation_ = false;  // 在没有建立地图前，是否要使用前几帧的IMU状态
     double timediff_lidar_wrt_imu_ = 0.0;
+    double imu_acc_input_scale_ = 1.0;
+    double imu_gyr_input_scale_ = 1.0;
+    bool require_imu_init_before_lidar_ = false;
+    double imu_init_min_duration_ = 1.0;
+    double imu_init_lidar_delay_ = 0.15;
+    double first_lidar_time_for_imu_init_ = -1.0;
     double last_timestamp_lidar_ = 0;
     double lidar_end_time_ = 0;
     double last_timestamp_imu_ = -1.0;

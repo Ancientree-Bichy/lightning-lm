@@ -8,6 +8,8 @@
 
 #include "common/eigen_types.h"
 
+#include <cstdint>
+
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
 
@@ -49,6 +51,21 @@ struct EIGEN_ALIGN16 Point {
 
 // clang-format off
 POINT_CLOUD_REGISTER_POINT_STRUCT(velodyne_ros::Point,
+                                  (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)
+                                      (float, time, time)(std::uint16_t, ring, ring))
+
+namespace jt128_ros {
+struct EIGEN_ALIGN16 Point {
+    PCL_ADD_POINT4D
+
+    float intensity;
+    float time;
+    std::uint16_t ring;
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+}  // namespace jt128_ros
+
+POINT_CLOUD_REGISTER_POINT_STRUCT(jt128_ros::Point,
                                   (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)
                                       (float, time, time)(std::uint16_t, ring, ring))
 

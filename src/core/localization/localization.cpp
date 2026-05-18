@@ -3,6 +3,7 @@
 
 #include "core/localization/lidar_loc/lidar_loc.h"
 #include "core/localization/localization.h"
+#include "core/lightning_math.hpp"
 
 #include <opencv2/highgui.hpp>
 
@@ -129,7 +130,10 @@ bool Localization::Init(const std::string& yaml_path, const std::string& global_
         LOG(INFO) << "Using OUST 64 Lidar";
     } else if (lidar_type == 4) {
         preprocess_->SetLidarType(LidarType::ROBOSENSE);
-        LOG(INFO) << "Using OUST 64 Lidar";
+        LOG(INFO) << "Using RoboSense Lidar";
+    } else if (lidar_type == 5) {
+        preprocess_->SetLidarType(LidarType::JT128);
+        LOG(INFO) << "Using Hesai JT128 Lidar";
     } else {
         LOG(WARNING) << "unknown lidar_type";
     }
@@ -249,6 +253,29 @@ void Localization::LidarLocProcCloud(CloudPtr scan_undist) {
         loc_state_callback_(*loc_state);
     }
 
+    if (res.lidar_loc_valid_ && (pointcloud_body_callback_ || pointcloud_world_callback_)) {
+        const auto stamp = math::FromSec(res.timestamp_);
+
+        if (pointcloud_body_callback_) {
+            sensor_msgs::msg::PointCloud2 body_msg;
+            pcl::toROSMsg(*scan_undist, body_msg);
+            body_msg.header.stamp = stamp;
+            body_msg.header.frame_id = "base_link";
+            pointcloud_body_callback_(body_msg);
+        }
+
+        if (pointcloud_world_callback_) {
+            CloudPtr world_cloud(new PointCloudType);
+            pcl::transformPointCloud(*scan_undist, *world_cloud, res.pose_.matrix().cast<float>());
+
+            sensor_msgs::msg::PointCloud2 world_msg;
+            pcl::toROSMsg(*world_cloud, world_msg);
+            world_msg.header.stamp = stamp;
+            world_msg.header.frame_id = "map";
+            pointcloud_world_callback_(world_msg);
+        }
+    }
+
     // cv::Mat img(100, 100, CV_8UC3, cv::Scalar(255, 255, 255));
     // cv::imshow("img", img);
     // cv::waitKey(0);
@@ -347,5 +374,13 @@ void Localization::SetExternalPose(const Eigen::Quaterniond& q, const Eigen::Vec
 }
 
 void Localization::SetTFCallback(Localization::TFCallback&& callback) { tf_callback_ = callback; }
+
+void Localization::SetPointcloudWorldCallback(Localization::PointcloudWorldCallback&& callback) {
+    pointcloud_world_callback_ = callback;
+}
+
+void Localization::SetPointcloudBodyCallback(Localization::PointcloudBodyCallback&& callback) {
+    pointcloud_body_callback_ = callback;
+}
 
 }  // namespace lightning::loc

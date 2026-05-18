@@ -5,7 +5,11 @@
 #ifndef LIGHTNING_LOC_SYSTEM_H
 #define LIGHTNING_LOC_SYSTEM_H
 
+#include <builtin_interfaces/msg/time.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -25,7 +29,18 @@ class Localization;
 class LocSystem {
    public:
     struct Options {
-        bool pub_tf_ = true;  // 是否发布tf
+        bool pub_tf_ = true;                    // 是否发布tf
+        bool enable_rviz_ = false;              // 是否启用RViz辅助话题
+        bool auto_start_from_identity_ = true;  // 是否启动后立即以单位位姿初始化
+        std::string initialpose_topic_ = "/initialpose";
+        std::string map_topic_ = "/overall_map";
+        std::string odom_topic_ = "/laser_odometry";
+        std::string registered_scan_topic_ = "/registered_scan";
+        std::string obs_cloud_topic_ = "/laser_cloud_map";
+        std::string map_frame_id_ = "map";
+        std::string output_child_frame_id_ = "base_link";
+        std::string rviz_initial_pose_frame_ = "sensor";
+        bool rviz_initial_pose_is_body_frame_ = false;
     };
 
     explicit LocSystem(Options options);
@@ -36,6 +51,8 @@ class LocSystem {
 
     /// 设置初始化位姿
     void SetInitPose(const SE3& pose);
+
+    bool AutoStartFromIdentity() const { return options_.auto_start_from_identity_; }
 
     /// 处理IMU
     void ProcessIMU(const lightning::IMUPtr& imu);
@@ -62,10 +79,32 @@ class LocSystem {
     std::string imu_topic_;
     std::string cloud_topic_;
     std::string livox_topic_;
+    std::string map_path_;
 
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_ = nullptr;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_ = nullptr;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr livox_sub_ = nullptr;
+    rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initialpose_sub_ = nullptr;
+
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_ = nullptr;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_ = nullptr;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr registered_scan_pub_ = nullptr;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr obs_cloud_pub_ = nullptr;
+    rclcpp::TimerBase::SharedPtr map_pub_timer_ = nullptr;
+    sensor_msgs::msg::PointCloud2 rviz_map_msg_;
+    bool rviz_map_msg_loaded_ = false;
+    bool rviz_map_missing_warned_ = false;
+    SE3 T_body_lidar_;
+
+    SE3 RvizInitialPoseToInternalPose(const SE3& pose) const;
+    SE3 InternalPoseToOutputPose(const SE3& pose) const;
+    geometry_msgs::msg::TransformStamped MakeOutputTransform(const SE3& pose,
+                                                             const builtin_interfaces::msg::Time& stamp) const;
+    void HandleInitialPose(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr& msg);
+    void PublishPoseVisualization(const SE3& pose);
+    void PublishOdom(const geometry_msgs::msg::TransformStamped& pose);
+    void PublishRvizCloudAliases(const sensor_msgs::msg::PointCloud2& cloud);
+    void PublishRvizMap();
 };
 
 };  // namespace lightning

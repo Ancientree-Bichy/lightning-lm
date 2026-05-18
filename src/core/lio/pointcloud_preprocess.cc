@@ -1,9 +1,72 @@
 #include "pointcloud_preprocess.h"
+#include <algorithm>
+#include <cstdint>
+#include <cmath>
+#include <cstring>
 #include <execution>
 
 #include <glog/logging.h>
 
 namespace lightning {
+namespace {
+
+const sensor_msgs::msg::PointField *FindField(const sensor_msgs::msg::PointCloud2 &msg, const std::string &name) {
+    const auto iter = std::find_if(msg.fields.begin(), msg.fields.end(),
+                                   [&name](const sensor_msgs::msg::PointField &field) { return field.name == name; });
+    return iter == msg.fields.end() ? nullptr : &(*iter);
+}
+
+template <typename T>
+T ReadUnaligned(const std::uint8_t *data) {
+    T value;
+    std::memcpy(&value, data, sizeof(T));
+    return value;
+}
+
+bool ReadNumericField(const std::uint8_t *point, const sensor_msgs::msg::PointField &field, double &value) {
+    const auto *data = point + field.offset;
+    switch (field.datatype) {
+        case sensor_msgs::msg::PointField::INT8:
+            value = ReadUnaligned<std::int8_t>(data);
+            return true;
+        case sensor_msgs::msg::PointField::UINT8:
+            value = ReadUnaligned<std::uint8_t>(data);
+            return true;
+        case sensor_msgs::msg::PointField::INT16:
+            value = ReadUnaligned<std::int16_t>(data);
+            return true;
+        case sensor_msgs::msg::PointField::UINT16:
+            value = ReadUnaligned<std::uint16_t>(data);
+            return true;
+        case sensor_msgs::msg::PointField::INT32:
+            value = ReadUnaligned<std::int32_t>(data);
+            return true;
+        case sensor_msgs::msg::PointField::UINT32:
+            value = ReadUnaligned<std::uint32_t>(data);
+            return true;
+        case sensor_msgs::msg::PointField::FLOAT32:
+            value = ReadUnaligned<float>(data);
+            return true;
+        case sensor_msgs::msg::PointField::FLOAT64:
+            value = ReadUnaligned<double>(data);
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ReadRingField(const std::uint8_t *point, const sensor_msgs::msg::PointField &field, std::uint16_t &value) {
+    double numeric_value = 0.0;
+    if (!ReadNumericField(point, field, numeric_value) || numeric_value < 0.0 ||
+        numeric_value > std::numeric_limits<std::uint16_t>::max()) {
+        return false;
+    }
+
+    value = static_cast<std::uint16_t>(numeric_value);
+    return true;
+}
+
+}  // namespace
 
 void PointCloudPreprocess::Set(LidarType lid_type, double bld, int pfilt_num) {
     lidar_type_ = lid_type;
@@ -23,6 +86,10 @@ void PointCloudPreprocess::Process(const sensor_msgs::msg::PointCloud2 ::SharedP
 
         case LidarType::ROBOSENSE:
             RoboSenseHandler(msg);
+            break;
+
+        case LidarType::JT128:
+            JT128Handler(msg);
             break;
 
         default:
@@ -252,6 +319,127 @@ void PointCloudPreprocess::VelodyneHandler(const sensor_msgs::msg::PointCloud2::
             }
         }
     }
+
+    cloud_out_.width = cloud_out_.size();
+    cloud_out_.height = 1;
+    cloud_out_.is_dense = false;
+}
+
+void PointCloudPreprocess::JT128Handler(const sensor_msgs::msg::PointCloud2::SharedPtr &msg) {
+    cloud_out_.clear();
+    cloud_full_.clear();
+
+    if (msg->is_bigendian) {
+        LOG(ERROR) << "JT128 big-endian PointCloud2 is not supported";
+        return;
+    }
+
+    const auto *x_field = FindField(*msg, "x");
+    const auto *y_field = FindField(*msg, "y");
+    const auto *z_field = FindField(*msg, "z");
+    const auto *intensity_field = FindField(*msg, "intensity");
+    const auto *ring_field = FindField(*msg, "ring");
+    const auto *time_field = FindField(*msg, "time");
+    const auto *timestamp_field = FindField(*msg, "timestamp");
+
+    if (x_field == nullptr || y_field == nullptr || z_field == nullptr || intensity_field == nullptr ||
+        ring_field == nullptr || (time_field == nullptr && timestamp_field == nullptr)) {
+        LOG(ERROR) << "JT128 PointCloud2 requires x/y/z/intensity/ring plus time or timestamp fields";
+        return;
+    }
+
+    const double blind_sq = blind_ * blind_;
+    const double range_max_sq = static_cast<double>(range_max_) * range_max_;
+    const double head_time = msg->header.stamp.sec + msg->header.stamp.nanosec / 1e9;
+    const std::size_t point_count = static_cast<std::size_t>(msg->width) * msg->height;
+    cloud_out_.reserve(point_count);
+
+    bool has_prev = false;
+    double prev_x = 0.0;
+    double prev_y = 0.0;
+    double prev_z = 0.0;
+
+    std::size_t point_index = 0;
+    for (std::uint32_t row = 0; row < msg->height; ++row) {
+        const auto *row_data = msg->data.data() + static_cast<std::size_t>(row) * msg->row_step;
+        for (std::uint32_t col = 0; col < msg->width; ++col, ++point_index) {
+            const auto *point = row_data + static_cast<std::size_t>(col) * msg->point_step;
+
+            double x = 0.0;
+            double y = 0.0;
+            double z = 0.0;
+            double intensity = 0.0;
+            double point_time = 0.0;
+            std::uint16_t ring = 0;
+
+            const bool readable = ReadNumericField(point, *x_field, x) && ReadNumericField(point, *y_field, y) &&
+                                  ReadNumericField(point, *z_field, z) &&
+                                  ReadNumericField(point, *intensity_field, intensity) &&
+                                  ReadRingField(point, *ring_field, ring) &&
+                                  ReadNumericField(point, timestamp_field != nullptr ? *timestamp_field : *time_field,
+                                                   point_time);
+            if (!readable) {
+                continue;
+            }
+
+            if (point_filter_num_ > 1 && point_index % point_filter_num_ != 0) {
+                has_prev = true;
+                prev_x = x;
+                prev_y = y;
+                prev_z = z;
+                continue;
+            }
+
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(point_time)) {
+                continue;
+            }
+
+            if (num_scans_ > 0 && ring >= static_cast<std::uint16_t>(num_scans_)) {
+                continue;
+            }
+
+            const double range = x * x + y * y + z * z;
+            if (range <= blind_sq || range > range_max_sq) {
+                continue;
+            }
+
+            if (z < height_min_ || z > height_max_) {
+                continue;
+            }
+
+            if (has_prev) {
+                const bool point_changed =
+                    (std::abs(x - prev_x) > 1e-7) || (std::abs(y - prev_y) > 1e-7) || (std::abs(z - prev_z) > 1e-7);
+                if (!point_changed) {
+                    continue;
+                }
+            }
+
+            has_prev = true;
+            prev_x = x;
+            prev_y = y;
+            prev_z = z;
+
+            PointType added_pt;
+            added_pt.x = x;
+            added_pt.y = y;
+            added_pt.z = z;
+            added_pt.intensity = intensity;
+
+            // SuperOdom-compatible adapters use relative "time" in seconds.
+            // The native JT128 bag uses absolute "timestamp" in seconds.
+            added_pt.time = timestamp_field != nullptr || point_time > 1e6 ? (point_time - head_time) * 1e3
+                                                                           : point_time * 1e3;
+            if (added_pt.time < 0.0) {
+                continue;
+            }
+
+            cloud_out_.points.push_back(added_pt);
+        }
+    }
+
+    std::sort(cloud_out_.points.begin(), cloud_out_.points.end(),
+              [](const PointType &lhs, const PointType &rhs) { return lhs.time < rhs.time; });
 
     cloud_out_.width = cloud_out_.size();
     cloud_out_.height = 1;

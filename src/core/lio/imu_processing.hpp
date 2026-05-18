@@ -35,8 +35,12 @@ class ImuProcess {
     void SetAccCov(const Vec3d &scaler);
     void SetGyrBiasCov(const Vec3d &b_g);
     void SetAccBiasCov(const Vec3d &b_a);
+    void SetGravityAlignInput(bool enabled) { gravity_align_input_ = enabled; }
 
     void Process(const MeasureGroup &meas, ESKF &kf_state, CloudPtr &scan);
+    bool TryInitFromIMU(const std::deque<lightning::IMUPtr> &imu_buffer, ESKF &kf_state, double min_duration);
+    lightning::IMUPtr CorrectIMU(const lightning::IMUPtr &imu) const;
+    CloudPtr CorrectCloud(const CloudPtr &cloud) const;
 
     bool IsIMUInited() const { return imu_need_init_ == false; }
     void SetUseIMUFilter(bool b) { use_imu_filter_ = b; }
@@ -53,7 +57,9 @@ class ImuProcess {
 
    private:
     void IMUInit(const MeasureGroup &meas, ESKF &kf_state, int &N);
+    void FinalizeInit(ESKF &kf_state);
     void UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, CloudPtr &pcl_out);
+    Mat3d CalculatePitchRollMatrix(const Vec3d &acc) const;
 
     static inline constexpr int max_init_count_ = 20;
 
@@ -69,6 +75,9 @@ class ImuProcess {
     Vec3d angvel_last_ = Vec3d ::Zero();
     Vec3d acc_s_last_ = Vec3d ::Zero();
     double acc_scale_factor_ = 1.0;
+    Mat3d gravity_aligned_lidar_R_ = Mat3d::Identity();
+    bool gravity_align_input_ = false;
+    bool gravity_aligned_lidar_R_valid_ = false;
 
     double last_lidar_end_time_ = 0;
     int init_iter_num_ = 1;
@@ -99,6 +108,8 @@ inline void ImuProcess::Reset() {
     mean_gyr_ = Vec3d(0, 0, 0);
     angvel_last_.setZero();
     acc_scale_factor_ = 1.0;
+    gravity_aligned_lidar_R_ = Mat3d::Identity();
+    gravity_aligned_lidar_R_valid_ = false;
 
     imu_need_init_ = true;
     init_iter_num_ = 1;
@@ -120,6 +131,90 @@ inline void ImuProcess::SetAccCov(const Vec3d &scaler) { cov_acc_scale_ = scaler
 inline void ImuProcess::SetGyrBiasCov(const Vec3d &b_g) { cov_bias_gyr_ = b_g; }
 
 inline void ImuProcess::SetAccBiasCov(const Vec3d &b_a) { cov_bias_acc_ = b_a; }
+
+inline Mat3d ImuProcess::CalculatePitchRollMatrix(const Vec3d &acc) const {
+    const double theta = std::atan2(acc.x(), std::sqrt(acc.y() * acc.y() + acc.z() * acc.z()));
+    const double phi = std::atan2(-acc.y(), acc.z());
+
+    Mat3d R_y;
+    R_y << std::cos(theta), 0.0, std::sin(theta), 0.0, 1.0, 0.0, -std::sin(theta), 0.0, std::cos(theta);
+
+    Mat3d R_x;
+    R_x << 1.0, 0.0, 0.0, 0.0, std::cos(phi), -std::sin(phi), 0.0, std::sin(phi), std::cos(phi);
+
+    return R_x * R_y;
+}
+
+inline lightning::IMUPtr ImuProcess::CorrectIMU(const lightning::IMUPtr &imu) const {
+    if (!imu || imu_need_init_) {
+        return imu;
+    }
+
+    auto corrected = std::make_shared<lightning::IMU>(*imu);
+    if (gravity_align_input_ && gravity_aligned_lidar_R_valid_) {
+        corrected->linear_acceleration = gravity_aligned_lidar_R_ * corrected->linear_acceleration;
+        corrected->angular_velocity = gravity_aligned_lidar_R_ * corrected->angular_velocity;
+    }
+
+    corrected->linear_acceleration *= acc_scale_factor_;
+    return corrected;
+}
+
+inline CloudPtr ImuProcess::CorrectCloud(const CloudPtr &cloud) const {
+    if (!cloud || !gravity_align_input_ || !gravity_aligned_lidar_R_valid_) {
+        return cloud;
+    }
+
+    CloudPtr corrected(new PointCloudType(*cloud));
+    const Mat3f R = gravity_aligned_lidar_R_.cast<float>();
+    for (auto &pt : corrected->points) {
+        pt.getVector3fMap() = R * pt.getVector3fMap();
+    }
+
+    return corrected;
+}
+
+inline void ImuProcess::FinalizeInit(ESKF &kf_state) {
+    cov_acc_ = cov_acc_scale_;
+    cov_gyr_ = cov_gyr_scale_;
+
+    const double mean_acc_norm = mean_acc_.norm();
+    auto init_state = kf_state.GetX();
+
+    if (gravity_align_input_) {
+        if (mean_acc_norm > 1e-6) {
+            const Mat3d roll_pitch_gravity = CalculatePitchRollMatrix(mean_acc_);
+            gravity_aligned_lidar_R_ = roll_pitch_gravity.inverse() * R_lidar_imu_;
+            gravity_aligned_lidar_R_valid_ = true;
+            acc_scale_factor_ = G_m_s2 / mean_acc_norm;
+
+            const Vec3d aligned_mean_acc = gravity_aligned_lidar_R_ * mean_acc_;
+            init_state.grav_ = -aligned_mean_acc / aligned_mean_acc.norm() * G_m_s2;
+            init_state.bg_ = gravity_aligned_lidar_R_ * mean_gyr_;
+            kf_state.ChangeX(init_state);
+        } else {
+            gravity_aligned_lidar_R_ = Mat3d::Identity();
+            gravity_aligned_lidar_R_valid_ = false;
+            acc_scale_factor_ = 1.0;
+            LOG(WARNING) << "imu init mean acc norm is too small for gravity alignment: " << mean_acc_norm;
+        }
+    } else if (mean_acc_norm > 0.5 && mean_acc_norm < 1.5) {
+        acc_scale_factor_ = G_m_s2;
+    } else if (mean_acc_norm > 7.0 && mean_acc_norm < 12.0) {
+        acc_scale_factor_ = 1.0;
+    } else {
+        acc_scale_factor_ = 1.0;
+        LOG(WARNING) << "imu init mean acc norm is abnormal for unit inference: " << mean_acc_norm
+                     << ", keep accelerometer scale unchanged";
+    }
+
+    imu_need_init_ = false;
+
+    LOG(INFO) << "imu init done, bg: " << kf_state.GetX().bg_.transpose() << ", grav: "
+              << kf_state.GetX().grav_.transpose() << ", acc scale: " << acc_scale_factor_
+              << ", mean: " << mean_acc_.transpose() << ", gyr mean: " << mean_gyr_.transpose()
+              << ", gravity_align_input: " << gravity_align_input_;
+}
 
 inline void ImuProcess::IMUInit(const MeasureGroup &meas, ESKF &kf_state, int &N) {
     /** 1. initializing the gravity_, gyro bias, acc and gyro covariance
@@ -175,6 +270,9 @@ inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, C
     /*** add the imu_ of the last frame-tail to the of current frame-head ***/
     auto v_imu = meas.imu_;
     v_imu.push_front(last_imu_);
+    for (auto &imu : v_imu) {
+        imu = CorrectIMU(imu);
+    }
     const double &imu_end_time = v_imu.back()->timestamp;
 
     const double &pcl_beg_time = meas.lidar_begin_time_;
@@ -210,7 +308,6 @@ inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, C
 
         angvel_avr = .5 * (head->angular_velocity + tail->angular_velocity);
         acc_avr = .5 * (head->linear_acceleration + tail->linear_acceleration);
-        acc_avr = acc_avr * acc_scale_factor_;
 
         if (head->timestamp < last_lidar_end_time_) {
             dt = tail->timestamp - last_lidar_end_time_;
@@ -325,27 +422,8 @@ inline void ImuProcess::Process(const MeasureGroup &meas, ESKF &kf_state, CloudP
 
         last_imu_ = meas.imu_.back();
 
-        auto imu_state = kf_state.GetX();
         if (init_iter_num_ > max_init_count_) {
-            imu_need_init_ = false;
-
-            cov_acc_ = cov_acc_scale_;
-            cov_gyr_ = cov_gyr_scale_;
-            const double mean_acc_norm = mean_acc_.norm();
-
-            if (mean_acc_norm > 0.5 && mean_acc_norm < 1.5) {
-                acc_scale_factor_ = G_m_s2;
-            } else if (mean_acc_norm > 7.0 && mean_acc_norm < 12.0) {
-                acc_scale_factor_ = 1.0;
-            } else {
-                acc_scale_factor_ = 1.0;
-                LOG(WARNING) << "imu init mean acc norm is abnormal for unit inference: " << mean_acc_norm
-                             << ", keep accelerometer scale unchanged";
-            }
-
-            LOG(INFO) << "imu init done, bg: " << imu_state.bg_.transpose() << ", grav: " << imu_state.grav_.transpose()
-                      << ", acc scale: " << acc_scale_factor_ << ", mean: " << mean_acc_.transpose() << ", "
-                      << mean_gyr_.transpose();
+            FinalizeInit(kf_state);
         } else {
             LOG(INFO) << "waiting for imu init ... " << init_iter_num_;
         }
@@ -354,6 +432,31 @@ inline void ImuProcess::Process(const MeasureGroup &meas, ESKF &kf_state, CloudP
     }
 
     Timer::Evaluate([&, this]() { UndistortPcl(meas, kf_state, scan); }, "Undistort Pcl");
+}
+
+inline bool ImuProcess::TryInitFromIMU(const std::deque<lightning::IMUPtr> &imu_buffer, ESKF &kf_state,
+                                       double min_duration) {
+    if (!imu_need_init_) {
+        return true;
+    }
+
+    if (imu_buffer.size() < 2) {
+        return false;
+    }
+
+    const double duration = imu_buffer.back()->timestamp - imu_buffer.front()->timestamp;
+    if (duration < min_duration) {
+        return false;
+    }
+
+    MeasureGroup meas;
+    meas.imu_ = imu_buffer;
+    int N = 1;
+    IMUInit(meas, kf_state, N);
+    FinalizeInit(kf_state);
+    last_imu_ = imu_buffer.back();
+    last_lidar_end_time_ = 0.0;
+    return true;
 }
 }  // namespace lightning
 

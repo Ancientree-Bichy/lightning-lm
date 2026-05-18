@@ -29,8 +29,13 @@ int main(int argc, char** argv) {
         LOG(ERROR) << "failed to init loc";
     }
 
-    /// 默认起点开始定位
-    loc.SetInitPose(SE3());
+    if (loc.AutoStartFromIdentity()) {
+        /// 保持旧数据集默认行为：从地图原点开始定位
+        loc.SetInitPose(SE3());
+    } else {
+        LOG(INFO) << "waiting for RViz initial pose";
+    }
+
     loc.Spin();
 
     rclcpp::shutdown();

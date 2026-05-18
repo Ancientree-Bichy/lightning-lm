@@ -81,10 +81,10 @@ class Localization {
     using PointcloudWorldCallback = std::function<void(const sensor_msgs::msg::PointCloud2& pointcloud)>;
 
     void SetTFCallback(TFCallback&& callback);
+    void SetPointcloudWorldCallback(PointcloudWorldCallback&& callback);
+    void SetPointcloudBodyCallback(PointcloudBodyCallback&& callback);
 
     // void SetPathCallback(std::function<void(const nav_msgs::msg::Path& path)>&& callback);
-    // void SetPointcloudWorldCallback(std::function<void(const sensor_msgs::msg::PointCloud2& pointcloud)>&& callback);
-    // void SetPointcloudBodyCallback(std::function<void(const sensor_msgs::msg::PointCloud2& pointcloud)>&& callback);
     // void SetLocStateCallback(std::function<void(const std_msgs::msg::Int32& state)>&& callback);
     // void SetHealthDiagNormalCallback(interface::health_diag_normal_callback&& callback);
 
