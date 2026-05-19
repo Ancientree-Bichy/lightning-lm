@@ -100,6 +100,9 @@ bool LocSystem::Init(const std::string &yaml_path) {
     options_.map_frame_id_ = GetYamlValueOr<std::string>(yaml_node, "system", "map_frame_id", options_.map_frame_id_);
     options_.output_child_frame_id_ =
         GetYamlValueOr<std::string>(yaml_node, "system", "output_child_frame_id", options_.output_child_frame_id_);
+    options_.rviz_initial_pose_z_offset_m_ =
+        GetYamlValueOr<double>(yaml_node, "system", "rviz_initial_pose_z_offset_m",
+                               options_.rviz_initial_pose_z_offset_m_);
     options_.rviz_initial_pose_frame_ = NormalizeFrameName(
         GetYamlValueOr<std::string>(yaml_node, "system", "rviz_initial_pose_frame", options_.rviz_initial_pose_frame_));
 
@@ -121,7 +124,8 @@ bool LocSystem::Init(const std::string &yaml_path) {
     T_body_lidar_ = XyzRpyToSE3(lidar_to_body_xyzrpy, extrinsic_rpy_degrees);
 
     LOG(INFO) << "RViz initial pose frame: " << options_.rviz_initial_pose_frame_
-              << ", output child frame: " << options_.output_child_frame_id_;
+              << ", output child frame: " << options_.output_child_frame_id_
+              << ", z offset: " << options_.rviz_initial_pose_z_offset_m_ << " m";
 
     LOG(INFO) << "online mode, creating ros2 node ... ";
 
@@ -221,11 +225,13 @@ void LocSystem::HandleInitialPose(const geometry_msgs::msg::PoseWithCovarianceSt
     }
     q.normalize();
 
-    const SE3 rviz_pose(q, Vec3d(p.x, p.y, p.z));
+    const double z = p.z + options_.rviz_initial_pose_z_offset_m_;
+    const SE3 rviz_pose(q, Vec3d(p.x, p.y, z));
     const SE3 internal_pose = RvizInitialPoseToInternalPose(rviz_pose);
 
     SetInitPose(internal_pose);
-    LOG(INFO) << "accepted RViz initial pose from topic: " << options_.initialpose_topic_;
+    LOG(INFO) << "accepted RViz initial pose from topic: " << options_.initialpose_topic_
+              << ", input z: " << p.z << ", adjusted z: " << z;
 }
 
 SE3 LocSystem::RvizInitialPoseToInternalPose(const SE3& pose) const {

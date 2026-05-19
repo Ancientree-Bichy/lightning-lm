@@ -41,6 +41,7 @@ class LocSystem {
         std::string output_child_frame_id_ = "base_link";
         std::string rviz_initial_pose_frame_ = "sensor";
         bool rviz_initial_pose_is_body_frame_ = false;
+        double rviz_initial_pose_z_offset_m_ = 0.0;
     };
 
     explicit LocSystem(Options options);

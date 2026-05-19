@@ -1,11 +1,13 @@
 # Hesai JT128 / Unitree A2 configuration.
+# Live and bag JT128 topics are expected to match:
+# /lidar_points and /lidar_imu.
 # Input point cloud should match the SuperOdom adapter layout:
 # x, y, z, intensity, time(seconds), ring.
 common:
   dataset: "jt128"
-  lidar_topic: "/hesai/jt128/points_superodom"
+  lidar_topic: "/lidar_points"
   livox_lidar_topic: "/livox/lidar"
-  imu_topic: "/hesai/jt128/imu"
+  imu_topic: "/lidar_imu"
 
 fasterlio:
   lidar_type: 5                # 5 for Hesai JT128 PointCloud2 x/y/z/intensity/time/ring
@@ -87,6 +89,7 @@ system:
   # RViz 2D Pose Estimate is the robot body pose. Lightning's localization core
   # still receives the internal gravity-aligned JT128 LiDAR pose.
   rviz_initial_pose_frame: base_link
+  rviz_initial_pose_z_offset_m: 0.75
   rviz_initial_pose_lidar_to_body_xyzrpy: [0.33767, 0.0, 0.08134, 0.0, 0.0, 1.57079632679]
   rviz_initial_pose_extrinsic_rpy_degrees: false
 

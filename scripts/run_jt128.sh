@@ -12,7 +12,7 @@ DEFAULT_EXTERNAL_MAP="${REPO_ROOT}/data/external_map"
 DEFAULT_PANGOLIN_PREFIX="${HOME}/.local/pangolin-0.9.3"
 DEFAULT_BAG_LIDAR_TOPIC="/lidar_points"
 DEFAULT_BAG_IMU_TOPIC="/lidar_imu"
-DEFAULT_NAV_SCRIPT="${WORKSPACE_ROOT}/bringup/scripts/run_go2w_superloc_navigation.sh"
+DEFAULT_NAV_SCRIPT="${WORKSPACE_ROOT}/bringup/scripts/run_jt128_manual_unitree.sh"
 DEFAULT_UNITREE_PARAMS="${WORKSPACE_ROOT}/unitree_adapter/config/unitree_adapter.yaml"
 DEFAULT_RVIZ_CONFIG="${WORKSPACE_ROOT}/bringup/rviz/robocup_navigation.rviz"
 
@@ -30,6 +30,8 @@ WAIT_SECONDS="2"
 SOURCE_SETUP=1
 BAG_LIDAR_TOPIC="${DEFAULT_BAG_LIDAR_TOPIC}"
 BAG_IMU_TOPIC="${DEFAULT_BAG_IMU_TOPIC}"
+CONFIG_LIDAR_TOPIC_OVERRIDE="${JT128_LIDAR_TOPIC:-}"
+CONFIG_IMU_TOPIC_OVERRIDE="${JT128_IMU_TOPIC:-}"
 AUTO_BAG_TOPIC_OVERRIDE=1
 CONVERT_OVERWRITE=0
 VIS_MODE="${JT128_VIZ_MODE:-rviz}"
@@ -41,13 +43,28 @@ NAV_ENABLE_RVIZ=1
 NAV_DRY_RUN=0
 NAV_BOUNDARY_FILE=""
 NAV_BOUNDARY_DISABLED=0
+NAV_MANUAL_ROUTE_FILE="${MANUAL_ROUTE_FILE:-}"
+NAV_AUTO_START_ROUTE=1
+NAV_ROUTE_WAIT_TIMEOUT="${ROUTE_WAIT_TIMEOUT_SEC:-0}"
+NAV_UNITREE_BRIDGE="${UNITREE_BRIDGE_TYPE:-adapter}"
 NAV_UNITREE_BACKEND="${UNITREE_BACKEND_TYPE:-sdk2}"
 NAV_ROBOT_MODEL="${UNITREE_ROBOT_MODEL:-a2}"
 NAV_NETWORK_INTERFACE="${UNITREE_NETWORK_INTERFACE:-}"
+NAV_UNITREE_SDK_PREFIX="${UNITREE_SDK_PREFIX:-}"
+NAV_UNITREE_SDK_SOURCE="${UNITREE_SDK_SOURCE_DIR:-}"
+NAV_A2_CMD_VEL_BRIDGE_SCRIPT="${UNITREE_A2_CMD_VEL_BRIDGE_SCRIPT:-$HOME/unitree/start_a2_cmd_vel_bridge.sh}"
+NAV_UNITREE_SDK_TIMEOUT_SEC="${UNITREE_SDK_TIMEOUT_SEC:-2.0}"
+NAV_ADAPTER_CMD_TIMEOUT_SEC="${UNITREE_ADAPTER_CMD_TIMEOUT_SEC:-0.25}"
 NAV_ADAPTER_ENABLED_ON_START=0
-NAV_ODOM_TIMEOUT="${EXTERNAL_LOCALIZATION_ODOM_TIMEOUT_SEC:-30}"
+NAV_ODOM_TIMEOUT="${EXTERNAL_LOCALIZATION_ODOM_TIMEOUT_SEC:-120}"
 NAV_UNITREE_PARAMS_FILE="${UNITREE_ADAPTER_PARAMS_FILE:-${DEFAULT_UNITREE_PARAMS}}"
+NAV_MAP_TOPIC="${MAP_TOPIC:-}"
+NAV_MAP_FRAME_ID="${MAP_FRAME_ID:-}"
+NAV_MAP_MAX_POINTS="${MAP_MAX_POINTS:-}"
+NAV_MAP_STRIDE="${MAP_STRIDE:-}"
+NAV_MAP_PERIOD="${MAP_PUBLISH_PERIOD_SEC:-}"
 APP_PID=""
+NAV_PID=""
 RVIZ_PID=""
 TMP_CONFIG=""
 STARTED_PID=""
@@ -61,7 +78,7 @@ Usage:
   scripts/run_jt128.sh loc-bag --bag BAG [--map MAP_DIR_OR_PCD] [--config CFG] [-- BAG_PLAY_ARGS...]
   scripts/run_jt128.sh lio-live [--config CFG]
   scripts/run_jt128.sh loc-live [--map MAP_DIR_OR_PCD] [--config CFG]
-  scripts/run_jt128.sh nav-live [--map MAP_DIR_OR_PCD] [--prior-map-pcd PCD] [--config CFG] [NAV_OPTIONS]
+  scripts/run_jt128.sh nav-live [--map MAP_DIR_OR_PCD] --manual-route-file YAML [--config CFG] [NAV_OPTIONS]
   scripts/run_jt128.sh lio-offline --bag BAG [--config CFG]
   scripts/run_jt128.sh loc-offline --bag BAG [--map MAP_DIR_OR_PCD] [--config CFG]
   scripts/run_jt128.sh convert-map --pcd INPUT.pcd [--map OUT_DIR] [--overwrite] [-- EXTRA_ARGS...]
@@ -72,8 +89,9 @@ Modes:
   lio-live      Start online LIO/SLAM for real sensors.
   loc-live      Start online localization for real sensors and load a map.
   nav-live      Start Lightning localization, wait for RViz initial pose, then
-                start TRG/follower/collision guard/Unitree adapter with
-                external localization topics.
+                start manual_planner path mode, pid_path_follower, and
+                unitree_adapter. TRG, SuperLoc/SuperOdom, and collision_guard
+                are intentionally not launched in this JT128 manual chain.
   lio-offline   Run the built-in offline bag reader for LIO/SLAM.
   loc-offline   Run the built-in offline bag reader for localization.
   convert-map   Convert an external PCD into a Lightning-LM tiled map directory.
@@ -87,7 +105,18 @@ Options:
                       Lightning map directory when present, otherwise converts first.
                       Default: data/new_map for loc, data/external_map for convert-map.
       --prior-map-pcd PCD
-                      TRG prior map PCD for nav-live. Default: MAP/global.pcd.
+                      Prior-map preview PCD for the manual Unitree chain.
+                      Default: MAP/global.pcd when it exists.
+      --map-topic TOPIC
+                      Prior-map preview topic in nav-live. Default:
+                      /trg/output/prebuilt_map in the downstream script.
+      --map-frame-id FRAME
+                      Prior-map preview frame in nav-live. Default: map.
+      --map-max-points N
+                      Max preview points after downsampling in nav-live.
+      --map-stride N Keep every Nth PCD point before max-points in nav-live.
+      --map-period SEC
+                      Prior-map preview republish period in nav-live.
       --run-name NAME Output/run name for nav-live.
       --skip-build    Reuse existing navigation install trees in nav-live.
       --viz MODE      Visualization mode for loc-bag/loc-live:
@@ -98,22 +127,47 @@ Options:
       --no-rviz       Do not launch RViz in loc-bag/loc-live/nav-live.
       --rviz-config RVIZ
                       RViz config for loc-bag/loc-live/nav-live.
-      --dry-run       Do not launch Unitree adapter in nav-live.
+      --dry-run       Do not launch Unitree hardware bridge in nav-live.
       --network-interface IFACE
                       Unitree SDK2 network interface for nav-live.
+      --unitree-bridge TYPE
+                      Hardware bridge: adapter or a2_cmd_vel. Default:
+                      adapter.
       --unitree-backend TYPE
-                      Unitree adapter backend for nav-live. Default: sdk2.
+                      Unitree adapter backend for nav-live. Only used with
+                      --unitree-bridge adapter. Default: sdk2.
       --robot-model MODEL
                       Unitree model for nav-live. Default: a2.
       --unitree-params-file YAML
                       Unitree adapter params for nav-live.
+      --unitree-sdk-prefix DIR
+                      SDK2 install prefix for nav-live.
+      --unitree-sdk-source DIR
+                      SDK2 source checkout for nav-live. Default is
+                      ~/unitree/unitree_sdk2 in the downstream script.
+      --a2-cmd-vel-bridge-script FILE
+                      Script for the a2_cmd_vel Unitree bridge. Default:
+                      ~/unitree/start_a2_cmd_vel_bridge.sh.
       --adapter-enabled-on-start
                       Start Unitree adapter enabled. Default is disabled.
+      --unitree-sdk-timeout-sec SEC
+                      Unitree SDK2 API call timeout for nav-live. Default: 2.0.
+      --adapter-cmd-timeout-sec SEC
+                      Unitree adapter command freshness timeout. Default: 0.25.
+      --manual-route-file YAML
+                      Manual route YAML for nav-live path replay.
+      --route-wait-timeout SEC
+                      Wait timeout for manual route completion. 0 means no
+                      timeout. Default: 0.
+      --manual-start  Do not auto-call /manual_planner/start in nav-live.
+      --auto-start-route
+                      Auto-call /manual_planner/start after localization odom.
       --boundary-file YAML
-                      TRG allowed-area polygon for nav-live.
-      --no-boundary   Disable TRG boundary in nav-live.
+                      Accepted for legacy TRG scripts; ignored by the default
+                      manual Unitree nav-live script.
+      --no-boundary   Accepted for legacy TRG scripts.
       --external-odom-timeout SEC
-                      Wait timeout for first /laser_odometry before navigation. Default: 30.
+                      Wait timeout for first /laser_odometry before navigation. Default: 120.
       --overwrite     Replace convert-map output directory if it already exists.
       --bag-lidar-topic TOPIC
                       Bag lidar topic used when the bag does not match CFG.
@@ -121,6 +175,10 @@ Options:
       --bag-imu-topic TOPIC
                       Bag IMU topic used when the bag does not match CFG.
                       Default: /lidar_imu
+      --lidar-topic TOPIC
+                      Override CFG lidar_topic for live/bag/offline modes.
+      --imu-topic TOPIC
+                      Override CFG imu_topic for live/bag/offline modes.
       --no-auto-bag-topics
                       Do not generate a temporary config for detected bag topics.
       --wait SEC      Delay before ros2 bag play in *-bag modes. Default: 2
@@ -133,7 +191,9 @@ Example:
   scripts/run_jt128.sh loc-bag --bag ~/bags/jt128 --map ./data/new_map -- --clock --rate 0.5
   scripts/run_jt128.sh loc-live --map ~/maps/site.pcd
   scripts/run_jt128.sh convert-map --pcd ~/maps/site.pcd --map ./data/site_map --overwrite -- --voxel_size 0.1
-  scripts/run_jt128.sh nav-live --map ./data/site_map --skip-build --network-interface enp3s0
+  scripts/run_jt128.sh nav-live --map ./data/site_map \
+    --manual-route-file ./bringup/config/manual_routes/site.yaml \
+    --network-interface enp3s0
 Note:
   For --map ~/maps/site.pcd, the auto-converted Lightning map directory is
   ~/maps/site by default. If ~/maps/site already contains index.txt, it is reused.
@@ -162,6 +222,11 @@ start_background() {
     STARTED_PID=$!
 }
 
+start_child() {
+    "$@" &
+    STARTED_PID=$!
+}
+
 start_background_logged() {
     local log_file="$1"
     shift
@@ -186,9 +251,39 @@ terminate_process_group() {
     wait "${pid}" 2>/dev/null || true
 }
 
+interrupt_process_group() {
+    local pid="$1"
+    local attempts=40
+    local i
+    [[ -n "${pid}" ]] || return 0
+
+    kill -INT -- "-${pid}" 2>/dev/null || true
+    kill -INT "${pid}" 2>/dev/null || true
+    for ((i = 0; i < attempts; i++)); do
+        kill -0 "${pid}" 2>/dev/null || return 0
+        [[ "$(ps -o stat= -p "${pid}" 2>/dev/null | awk '{print $1}')" == Z* ]] && return 0
+        sleep 0.1
+    done
+    terminate_process_group "${pid}"
+}
+
+wait_for_child_status() {
+    local pid="$1"
+    local state
+    while kill -0 "${pid}" 2>/dev/null; do
+        state="$(ps -o stat= -p "${pid}" 2>/dev/null | awk '{print $1}')"
+        [[ "${state}" == Z* ]] && break
+        sleep 0.2
+    done
+    wait "${pid}"
+}
+
 cleanup() {
     local rc=$?
     trap - EXIT INT TERM
+
+    interrupt_process_group "${NAV_PID}"
+    NAV_PID=""
 
     terminate_process_group "${APP_PID}"
     APP_PID=""
@@ -524,6 +619,7 @@ detect_bag_topic_override() {
     local metadata
 
     [[ "${AUTO_BAG_TOPIC_OVERRIDE}" -eq 1 ]] || return
+    [[ -z "${CONFIG_LIDAR_TOPIC_OVERRIDE}" && -z "${CONFIG_IMU_TOPIC_OVERRIDE}" ]] || return
 
     metadata="$(bag_metadata_path)"
     [[ -f "${metadata}" ]] || return
@@ -790,22 +886,69 @@ run_nav_live() {
     if [[ "${NAV_ADAPTER_ENABLED_ON_START}" -eq 1 ]]; then
         nav_args+=(--adapter-enabled-on-start)
     fi
+    if [[ -n "${NAV_MANUAL_ROUTE_FILE}" ]]; then
+        nav_args+=(--manual-route-file "${NAV_MANUAL_ROUTE_FILE}")
+    fi
+    nav_args+=(--route-wait-timeout "${NAV_ROUTE_WAIT_TIMEOUT}")
+    if [[ "${NAV_AUTO_START_ROUTE}" -eq 1 ]]; then
+        nav_args+=(--auto-start-route)
+    else
+        nav_args+=(--manual-start)
+    fi
     if [[ "${NAV_BOUNDARY_DISABLED}" -eq 1 ]]; then
         nav_args+=(--no-boundary)
     elif [[ -n "${NAV_BOUNDARY_FILE}" ]]; then
         nav_args+=(--boundary-file "${NAV_BOUNDARY_FILE}")
     fi
+    if [[ -n "${PRIOR_MAP_PCD}" ]]; then
+        nav_args+=(--prior-map-pcd "${PRIOR_MAP_PCD}")
+    fi
+    if [[ -n "${NAV_MAP_TOPIC}" ]]; then
+        nav_args+=(--map-topic "${NAV_MAP_TOPIC}")
+    fi
+    if [[ -n "${NAV_MAP_FRAME_ID}" ]]; then
+        nav_args+=(--map-frame-id "${NAV_MAP_FRAME_ID}")
+    fi
+    if [[ -n "${NAV_MAP_MAX_POINTS}" ]]; then
+        nav_args+=(--map-max-points "${NAV_MAP_MAX_POINTS}")
+    fi
+    if [[ -n "${NAV_MAP_STRIDE}" ]]; then
+        nav_args+=(--map-stride "${NAV_MAP_STRIDE}")
+    fi
+    if [[ -n "${NAV_MAP_PERIOD}" ]]; then
+        nav_args+=(--map-period "${NAV_MAP_PERIOD}")
+    fi
     if [[ -n "${NAV_NETWORK_INTERFACE}" ]]; then
         nav_args+=(--network-interface "${NAV_NETWORK_INTERFACE}")
     fi
+    nav_args+=(--unitree-bridge "${NAV_UNITREE_BRIDGE}")
+    if [[ -n "${NAV_UNITREE_SDK_PREFIX}" ]]; then
+        nav_args+=(--unitree-sdk-prefix "${NAV_UNITREE_SDK_PREFIX}")
+    fi
+    if [[ -n "${NAV_UNITREE_SDK_SOURCE}" ]]; then
+        nav_args+=(--unitree-sdk-source "${NAV_UNITREE_SDK_SOURCE}")
+    fi
+    if [[ -n "${NAV_A2_CMD_VEL_BRIDGE_SCRIPT}" ]]; then
+        nav_args+=(--a2-cmd-vel-bridge-script "${NAV_A2_CMD_VEL_BRIDGE_SCRIPT}")
+    fi
+    nav_args+=(--unitree-sdk-timeout-sec "${NAV_UNITREE_SDK_TIMEOUT_SEC}")
+    nav_args+=(--adapter-cmd-timeout-sec "${NAV_ADAPTER_CMD_TIMEOUT_SEC}")
     nav_args+=(--unitree-backend "${NAV_UNITREE_BACKEND}")
     nav_args+=(--robot-model "${NAV_ROBOT_MODEL}")
 
-    note "starting navigation after manual initialization gate"
-    note "+ UNITREE_ADAPTER_PARAMS_FILE=${NAV_UNITREE_PARAMS_FILE} bash ${NAV_SCRIPT} ${nav_args[*]} ${EXTRA_ARGS[*]} ${PRIOR_MAP_PCD} ${RUN_NAME}"
-    UNITREE_ADAPTER_PARAMS_FILE="${NAV_UNITREE_PARAMS_FILE}" \
-        bash "${NAV_SCRIPT}" "${nav_args[@]}" "${EXTRA_ARGS[@]}" "${PRIOR_MAP_PCD}" "${RUN_NAME}"
+    note "starting manual route + PID + Unitree chain after manual initialization gate"
+    note "+ UNITREE_ADAPTER_PARAMS_FILE=${NAV_UNITREE_PARAMS_FILE} bash ${NAV_SCRIPT} ${nav_args[*]} ${EXTRA_ARGS[*]} ${RUN_NAME}"
+    start_child env \
+        "LOCALIZATION_BACKEND=lightning-lm" \
+        "UNITREE_ADAPTER_PARAMS_FILE=${NAV_UNITREE_PARAMS_FILE}" \
+        bash "${NAV_SCRIPT}" "${nav_args[@]}" "${EXTRA_ARGS[@]}" "${RUN_NAME}"
+    NAV_PID="${STARTED_PID}"
+
+    set +e
+    wait_for_child_status "${NAV_PID}"
     local rc=$?
+    set -e
+    NAV_PID=""
 
     terminate_process_group "${APP_PID}"
     APP_PID=""
@@ -875,6 +1018,31 @@ while [[ $# -gt 0 ]]; do
             PRIOR_MAP_PCD="$2"
             shift 2
             ;;
+        --map-topic)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_MAP_TOPIC="$2"
+            shift 2
+            ;;
+        --map-frame-id)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_MAP_FRAME_ID="$2"
+            shift 2
+            ;;
+        --map-max-points)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_MAP_MAX_POINTS="$2"
+            shift 2
+            ;;
+        --map-stride)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_MAP_STRIDE="$2"
+            shift 2
+            ;;
+        --map-period)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_MAP_PERIOD="$2"
+            shift 2
+            ;;
         -c|--config)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             CONFIG_PATH="$2"
@@ -936,6 +1104,11 @@ while [[ $# -gt 0 ]]; do
             NAV_NETWORK_INTERFACE="$2"
             shift 2
             ;;
+        --unitree-bridge)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_UNITREE_BRIDGE="$2"
+            shift 2
+            ;;
         --unitree-backend)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             NAV_UNITREE_BACKEND="$2"
@@ -951,8 +1124,51 @@ while [[ $# -gt 0 ]]; do
             NAV_UNITREE_PARAMS_FILE="$2"
             shift 2
             ;;
+        --unitree-sdk-prefix)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_UNITREE_SDK_PREFIX="$2"
+            shift 2
+            ;;
+        --unitree-sdk-source)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_UNITREE_SDK_SOURCE="$2"
+            shift 2
+            ;;
+        --a2-cmd-vel-bridge-script)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_A2_CMD_VEL_BRIDGE_SCRIPT="$2"
+            shift 2
+            ;;
         --adapter-enabled-on-start)
             NAV_ADAPTER_ENABLED_ON_START=1
+            shift
+            ;;
+        --unitree-sdk-timeout-sec)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_UNITREE_SDK_TIMEOUT_SEC="$2"
+            shift 2
+            ;;
+        --adapter-cmd-timeout-sec)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_ADAPTER_CMD_TIMEOUT_SEC="$2"
+            shift 2
+            ;;
+        --manual-route-file|--route-file)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_MANUAL_ROUTE_FILE="$2"
+            shift 2
+            ;;
+        --route-wait-timeout)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_ROUTE_WAIT_TIMEOUT="$2"
+            shift 2
+            ;;
+        --manual-start)
+            NAV_AUTO_START_ROUTE=0
+            shift
+            ;;
+        --auto-start-route)
+            NAV_AUTO_START_ROUTE=1
             shift
             ;;
         --boundary-file)
@@ -977,6 +1193,16 @@ while [[ $# -gt 0 ]]; do
         --bag-imu-topic)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             BAG_IMU_TOPIC="$2"
+            shift 2
+            ;;
+        --lidar-topic)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            CONFIG_LIDAR_TOPIC_OVERRIDE="$2"
+            shift 2
+            ;;
+        --imu-topic)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            CONFIG_IMU_TOPIC_OVERRIDE="$2"
             shift 2
             ;;
         --overwrite)
@@ -1043,8 +1269,6 @@ case "${MODE}" in
 esac
 
 RUN_CONFIG="${CONFIG_PATH}"
-CONFIG_LIDAR_TOPIC_OVERRIDE=""
-CONFIG_IMU_TOPIC_OVERRIDE=""
 case "${MODE}" in
     lio-bag|loc-bag|lio-offline|loc-offline)
         detect_bag_topic_override
@@ -1065,15 +1289,34 @@ esac
 if [[ "${MODE}" == "nav-live" ]]; then
     if [[ -z "${PRIOR_MAP_PCD}" && -n "${MAP_SOURCE_PCD}" ]]; then
         PRIOR_MAP_PCD="${MAP_SOURCE_PCD}"
+    elif [[ -z "${PRIOR_MAP_PCD}" && -f "${MAP_PATH}/global.pcd" ]]; then
+        PRIOR_MAP_PCD="${MAP_PATH}/global.pcd"
     fi
-    PRIOR_MAP_PCD="${PRIOR_MAP_PCD:-${MAP_PATH}/global.pcd}"
-    PRIOR_MAP_PCD="$(abs_path "${PRIOR_MAP_PCD}")"
     NAV_SCRIPT="$(abs_path "${NAV_SCRIPT}")"
     NAV_UNITREE_PARAMS_FILE="$(abs_path "${NAV_UNITREE_PARAMS_FILE}")"
+    if [[ -n "${NAV_UNITREE_SDK_PREFIX}" ]]; then
+        NAV_UNITREE_SDK_PREFIX="$(abs_path "${NAV_UNITREE_SDK_PREFIX}")"
+    fi
+    if [[ -n "${NAV_UNITREE_SDK_SOURCE}" ]]; then
+        NAV_UNITREE_SDK_SOURCE="$(abs_path "${NAV_UNITREE_SDK_SOURCE}")"
+    fi
+    if [[ -n "${NAV_A2_CMD_VEL_BRIDGE_SCRIPT}" ]]; then
+        NAV_A2_CMD_VEL_BRIDGE_SCRIPT="$(abs_path "${NAV_A2_CMD_VEL_BRIDGE_SCRIPT}")"
+    fi
 
-    [[ -f "${PRIOR_MAP_PCD}" ]] || die "prior map PCD not found: ${PRIOR_MAP_PCD}"
+    if [[ -n "${PRIOR_MAP_PCD}" ]]; then
+        PRIOR_MAP_PCD="$(abs_path "${PRIOR_MAP_PCD}")"
+        [[ -f "${PRIOR_MAP_PCD}" ]] || die "prior map PCD not found: ${PRIOR_MAP_PCD}"
+    fi
     [[ -f "${NAV_SCRIPT}" ]] || die "navigation script not found: ${NAV_SCRIPT}"
     [[ -f "${NAV_UNITREE_PARAMS_FILE}" ]] || die "Unitree params file not found: ${NAV_UNITREE_PARAMS_FILE}"
+    if [[ "${NAV_UNITREE_BRIDGE,,}" == "a2_cmd_vel" || "${NAV_UNITREE_BRIDGE,,}" == "a2-cmd-vel" ]]; then
+        [[ -f "${NAV_A2_CMD_VEL_BRIDGE_SCRIPT}" ]] || die "A2 cmd_vel bridge script not found: ${NAV_A2_CMD_VEL_BRIDGE_SCRIPT}"
+    fi
+    if [[ -n "${NAV_MANUAL_ROUTE_FILE}" ]]; then
+        NAV_MANUAL_ROUTE_FILE="$(abs_path "${NAV_MANUAL_ROUTE_FILE}")"
+        [[ -f "${NAV_MANUAL_ROUTE_FILE}" ]] || die "manual route file not found: ${NAV_MANUAL_ROUTE_FILE}"
+    fi
     if [[ -n "${NAV_BOUNDARY_FILE}" ]]; then
         NAV_BOUNDARY_FILE="$(abs_path "${NAV_BOUNDARY_FILE}")"
         [[ -f "${NAV_BOUNDARY_FILE}" ]] || die "boundary file not found: ${NAV_BOUNDARY_FILE}"
