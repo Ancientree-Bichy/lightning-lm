@@ -55,8 +55,12 @@ NAV_UNITREE_SDK_SOURCE="${UNITREE_SDK_SOURCE_DIR:-}"
 NAV_A2_CMD_VEL_BRIDGE_SCRIPT="${UNITREE_A2_CMD_VEL_BRIDGE_SCRIPT:-$HOME/unitree/start_a2_cmd_vel_bridge.sh}"
 NAV_UNITREE_SDK_TIMEOUT_SEC="${UNITREE_SDK_TIMEOUT_SEC:-2.0}"
 NAV_ADAPTER_CMD_TIMEOUT_SEC="${UNITREE_ADAPTER_CMD_TIMEOUT_SEC:-0.25}"
+NAV_MANUAL_FOLLOWER="${MANUAL_FOLLOWER_TYPE:-pid}"
+NAV_MANUAL_PATH_RESAMPLE_SPACING="${MANUAL_PLANNER_PATH_RESAMPLE_SPACING:-}"
 NAV_ADAPTER_ENABLED_ON_START=0
 NAV_ODOM_TIMEOUT="${EXTERNAL_LOCALIZATION_ODOM_TIMEOUT_SEC:-120}"
+NAV_ODOM_TOPIC="${MANUAL_PLANNER_ODOM_TOPIC:-/body_odometry}"
+NAV_INPUT_WAIT_TIMEOUT="${NAV_INPUT_WAIT_TIMEOUT_SEC:-10}"
 NAV_UNITREE_PARAMS_FILE="${UNITREE_ADAPTER_PARAMS_FILE:-${DEFAULT_UNITREE_PARAMS}}"
 NAV_MAP_TOPIC="${MAP_TOPIC:-}"
 NAV_MAP_FRAME_ID="${MAP_FRAME_ID:-}"
@@ -89,7 +93,7 @@ Modes:
   lio-live      Start online LIO/SLAM for real sensors.
   loc-live      Start online localization for real sensors and load a map.
   nav-live      Start Lightning localization, wait for RViz initial pose, then
-                start manual_planner path mode, pid_path_follower, and
+                start manual_planner path mode, selected follower, and
                 unitree_adapter. TRG, SuperLoc/SuperOdom, and collision_guard
                 are intentionally not launched in this JT128 manual chain.
   lio-offline   Run the built-in offline bag reader for LIO/SLAM.
@@ -154,6 +158,11 @@ Options:
                       Unitree SDK2 API call timeout for nav-live. Default: 2.0.
       --adapter-cmd-timeout-sec SEC
                       Unitree adapter command freshness timeout. Default: 0.25.
+      --manual-follower TYPE
+                      Manual path follower for nav-live: pid or rpp.
+                      Default: pid.
+      --manual-path-resample-spacing M
+                      Resample manual path before RPP tracking.
       --manual-route-file YAML
                       Manual route YAML for nav-live path replay.
       --route-wait-timeout SEC
@@ -167,7 +176,13 @@ Options:
                       manual Unitree nav-live script.
       --no-boundary   Accepted for legacy TRG scripts.
       --external-odom-timeout SEC
-                      Wait timeout for first /laser_odometry before navigation. Default: 120.
+                      Wait timeout for first body odometry before navigation. Default: 120.
+      --input-wait-timeout SEC
+                      Wait for one live LiDAR and IMU message before starting
+                      navigation. 0 disables this check. Default: 10.
+      --odom-topic TOPIC
+                      Planner/follower odometry topic in nav-live.
+                      Default: /body_odometry.
       --overwrite     Replace convert-map output directory if it already exists.
       --bag-lidar-topic TOPIC
                       Bag lidar topic used when the bag does not match CFG.
@@ -239,32 +254,57 @@ start_background_logged() {
     STARTED_PID=$!
 }
 
-terminate_process_group() {
+process_group_id() {
     local pid="$1"
     [[ -n "${pid}" ]] || return 0
-
-    kill -TERM -- "-${pid}" 2>/dev/null || true
-    kill -TERM "${pid}" 2>/dev/null || true
-    sleep 1
-    kill -KILL -- "-${pid}" 2>/dev/null || true
-    kill -KILL "${pid}" 2>/dev/null || true
-    wait "${pid}" 2>/dev/null || true
+    ps -o pgid= -p "${pid}" 2>/dev/null | tr -d '[:space:]' || true
 }
 
-interrupt_process_group() {
+signal_process_tree() {
     local pid="$1"
-    local attempts=40
+    local signal_name="${2:-TERM}"
+    local pgid self_pgid
+    [[ -n "${pid}" ]] || return 0
+
+    pgid="$(process_group_id "${pid}")"
+    self_pgid="$(process_group_id "$$")"
+    if [[ -n "${pgid}" && "${pgid}" != "${self_pgid}" ]]; then
+        kill "-${signal_name}" -- "-${pgid}" 2>/dev/null || true
+    fi
+    kill "-${signal_name}" "${pid}" 2>/dev/null || true
+}
+
+wait_for_pid_exit_quiet() {
+    local pid="$1"
+    local timeout_sec="${2:-4.0}"
+    local attempts
     local i
     [[ -n "${pid}" ]] || return 0
 
-    kill -INT -- "-${pid}" 2>/dev/null || true
-    kill -INT "${pid}" 2>/dev/null || true
+    attempts="$(awk -v timeout="${timeout_sec}" 'BEGIN { n = int(timeout * 10); print n > 0 ? n : 1 }')"
     for ((i = 0; i < attempts; i++)); do
         kill -0 "${pid}" 2>/dev/null || return 0
         [[ "$(ps -o stat= -p "${pid}" 2>/dev/null | awk '{print $1}')" == Z* ]] && return 0
         sleep 0.1
     done
-    terminate_process_group "${pid}"
+    return 1
+}
+
+terminate_process_group() {
+    local pid="$1"
+    [[ -n "${pid}" ]] || return 0
+
+    signal_process_tree "${pid}" TERM
+    wait_for_pid_exit_quiet "${pid}" 2.0 || signal_process_tree "${pid}" KILL
+    wait "${pid}" 2>/dev/null || true
+}
+
+interrupt_process_group() {
+    local pid="$1"
+    [[ -n "${pid}" ]] || return 0
+
+    signal_process_tree "${pid}" INT
+    wait_for_pid_exit_quiet "${pid}" 4.0 || terminate_process_group "${pid}"
 }
 
 wait_for_child_status() {
@@ -276,6 +316,17 @@ wait_for_child_status() {
         sleep 0.2
     done
     wait "${pid}"
+}
+
+wait_for_topic_message() {
+    local topic="$1"
+    local timeout_sec="$2"
+    [[ "${timeout_sec}" == "0" || "${timeout_sec}" == "0.0" ]] && return 0
+
+    note "waiting for one message on ${topic} before navigation startup"
+    if ! timeout "${timeout_sec}s" ros2 topic echo "${topic}" --once >/dev/null 2>&1; then
+        die "no message received on ${topic} within ${timeout_sec}s. Start/bridge the JT128 driver to the configured topics or pass --lidar-topic/--imu-topic."
+    fi
 }
 
 cleanup() {
@@ -871,7 +922,15 @@ run_nav_live() {
         die "run_loc_online exited before navigation startup, exit code ${rc}"
     fi
 
+    local input_lidar_topic
+    local input_imu_topic
+    input_lidar_topic="$(yaml_section_value "${RUN_CONFIG}" common lidar_topic)"
+    input_imu_topic="$(yaml_section_value "${RUN_CONFIG}" common imu_topic)"
+    wait_for_topic_message "${input_lidar_topic:-/lidar_points}" "${NAV_INPUT_WAIT_TIMEOUT}"
+    wait_for_topic_message "${input_imu_topic:-/lidar_imu}" "${NAV_INPUT_WAIT_TIMEOUT}"
+
     nav_args+=(--external-localization --external-odom-timeout "${NAV_ODOM_TIMEOUT}")
+    nav_args+=(--odom-topic "${NAV_ODOM_TOPIC}")
     if [[ "${NAV_SKIP_BUILD}" -eq 1 ]]; then
         nav_args+=(--skip-build)
     fi
@@ -933,12 +992,16 @@ run_nav_live() {
     fi
     nav_args+=(--unitree-sdk-timeout-sec "${NAV_UNITREE_SDK_TIMEOUT_SEC}")
     nav_args+=(--adapter-cmd-timeout-sec "${NAV_ADAPTER_CMD_TIMEOUT_SEC}")
+    nav_args+=(--manual-follower "${NAV_MANUAL_FOLLOWER}")
+    if [[ -n "${NAV_MANUAL_PATH_RESAMPLE_SPACING}" ]]; then
+        nav_args+=(--manual-path-resample-spacing "${NAV_MANUAL_PATH_RESAMPLE_SPACING}")
+    fi
     nav_args+=(--unitree-backend "${NAV_UNITREE_BACKEND}")
     nav_args+=(--robot-model "${NAV_ROBOT_MODEL}")
 
     note "starting manual route + PID + Unitree chain after manual initialization gate"
     note "+ UNITREE_ADAPTER_PARAMS_FILE=${NAV_UNITREE_PARAMS_FILE} bash ${NAV_SCRIPT} ${nav_args[*]} ${EXTRA_ARGS[*]} ${RUN_NAME}"
-    start_child env \
+    start_background env \
         "LOCALIZATION_BACKEND=lightning-lm" \
         "UNITREE_ADAPTER_PARAMS_FILE=${NAV_UNITREE_PARAMS_FILE}" \
         bash "${NAV_SCRIPT}" "${nav_args[@]}" "${EXTRA_ARGS[@]}" "${RUN_NAME}"
@@ -1153,6 +1216,16 @@ while [[ $# -gt 0 ]]; do
             NAV_ADAPTER_CMD_TIMEOUT_SEC="$2"
             shift 2
             ;;
+        --manual-follower|--follower)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_MANUAL_FOLLOWER="$2"
+            shift 2
+            ;;
+        --manual-path-resample-spacing)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_MANUAL_PATH_RESAMPLE_SPACING="$2"
+            shift 2
+            ;;
         --manual-route-file|--route-file)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             NAV_MANUAL_ROUTE_FILE="$2"
@@ -1180,9 +1253,23 @@ while [[ $# -gt 0 ]]; do
             NAV_BOUNDARY_DISABLED=1
             shift
             ;;
+        --clean-start|--no-clean-start)
+            EXTRA_ARGS+=("$1")
+            shift
+            ;;
         --external-odom-timeout)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             NAV_ODOM_TIMEOUT="$2"
+            shift 2
+            ;;
+        --input-wait-timeout|--sensor-wait-timeout)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_INPUT_WAIT_TIMEOUT="$2"
+            shift 2
+            ;;
+        --odom-topic)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            NAV_ODOM_TOPIC="$2"
             shift 2
             ;;
         --bag-lidar-topic)
@@ -1234,6 +1321,11 @@ while [[ $# -gt 0 ]]; do
             break
             ;;
         *)
+            if [[ "${MODE}" == "nav-live" && -z "${RUN_NAME}" ]]; then
+                RUN_NAME="$1"
+                shift
+                continue
+            fi
             die "unknown argument: $1"
             ;;
     esac

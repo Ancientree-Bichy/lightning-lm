@@ -81,7 +81,7 @@ system:
   auto_start_from_identity: false
   rviz_initialpose_topic: /initialpose
   rviz_map_topic: /overall_map
-  rviz_odom_topic: /laser_odometry
+  rviz_odom_topic: /body_odometry
   rviz_registered_scan_topic: /registered_scan
   rviz_obs_cloud_topic: /laser_cloud_map
   map_frame_id: map
