@@ -329,12 +329,68 @@ wait_for_topic_message() {
     fi
 }
 
+cleanup_nav_fallback_processes() {
+    local patterns=(
+        'rviz2 -d .*/bringup/rviz/robocup_navigation[.]rviz'
+        'rviz2 -d .*/robocup_manual_route_editor[.].*[.]rviz'
+        'ros2 run map_tools pcd_map_publisher_node'
+        '/map_tools/.*/pcd_map_publisher_node'
+        'manual_route_map_publisher_node'
+        'ros2 run trg_path_follower rpp_follower_node'
+        '/trg_path_follower/.*/rpp_follower_node'
+        'ros2 run pid_path_follower pid_path_follower_node'
+        '/pid_path_follower/.*/pid_path_follower_node'
+        'ros2 run manual_planner manual_route_player_node'
+        '/manual_planner/.*/manual_route_player_node'
+        'run_manual_route_editor[.]sh'
+        'ros2 launch manual_planner manual_route_editor[.]launch[.]py'
+        '/manual_planner/.*/manual_route_recorder_node'
+        'manual_route_recorder_node'
+        'ros2 launch unitree_adapter unitree_adapter[.]launch[.]py'
+        '/unitree_adapter/.*/unitree_adapter_node'
+        'wait_for_topic_once[.]py --topic '
+        'wait_manual_planner_terminal[.]py'
+        'ros2 topic echo --no-daemon /cmd_vel'
+        'ros2 topic echo --no-daemon --full-length /rpp/debug'
+        'ros2 topic echo --no-daemon --full-length /manual_planner/status'
+        'ros2 topic echo --no-daemon /unitree_adapter/status'
+        'ros2 topic echo --no-daemon /unitree_adapter/last_cmd'
+    )
+    local signal_name pid pgid args pattern matched self_pgid
+    self_pgid="$(process_group_id "$$")"
+
+    for signal_name in TERM KILL; do
+        while read -r pid pgid args; do
+            [[ -n "${pid}" ]] || continue
+            [[ "${pid}" == "$$" || "${pgid}" == "${self_pgid}" ]] && continue
+            matched=0
+            for pattern in "${patterns[@]}"; do
+                if [[ "${args}" =~ ${pattern} ]]; then
+                    matched=1
+                    break
+                fi
+            done
+            [[ "${matched}" -eq 1 ]] || continue
+            if [[ -n "${pgid}" && "${pgid}" != "${self_pgid}" ]]; then
+                kill "-${signal_name}" -- "-${pgid}" 2>/dev/null || true
+            fi
+            kill "-${signal_name}" "${pid}" 2>/dev/null || true
+        done < <(ps -eo pid=,pgid=,args=)
+        [[ "${signal_name}" == KILL ]] || sleep 0.5
+    done
+
+    if command -v ros2 >/dev/null 2>&1; then
+        ros2 daemon stop >/dev/null 2>&1 || true
+    fi
+}
+
 cleanup() {
     local rc=$?
-    trap - EXIT INT TERM
+    trap - EXIT HUP INT QUIT TERM
 
     interrupt_process_group "${NAV_PID}"
     NAV_PID=""
+    cleanup_nav_fallback_processes
 
     terminate_process_group "${APP_PID}"
     APP_PID=""
@@ -350,7 +406,9 @@ cleanup() {
 }
 
 trap cleanup EXIT
+trap 'exit 129' HUP
 trap 'exit 130' INT
+trap 'exit 131' QUIT
 trap 'exit 143' TERM
 
 abs_path() {
