@@ -331,6 +331,11 @@ wait_for_topic_message() {
 
 cleanup_nav_fallback_processes() {
     local patterns=(
+        'lightning-lm/scripts/run_jt128[.]sh'
+        'ros2 run lightning run_loc_online'
+        '/lightning/.*/run_loc_online'
+        'run_loc_online --config '
+        'lightning-jt128[.].*[.]yaml'
         'rviz2 -d .*/bringup/rviz/robocup_navigation[.]rviz'
         'rviz2 -d .*/robocup_manual_route_editor[.].*[.]rviz'
         'ros2 run map_tools pcd_map_publisher_node'
