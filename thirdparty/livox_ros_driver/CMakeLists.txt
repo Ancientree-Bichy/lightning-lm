@@ -135,3 +135,16 @@ add_definitions(${PCL_DEFINITIONS})
 #       config
 #       launch_ROS2
 # )
+
+# This driver is built as an embedded subdirectory of the lightning package
+# here, so ament_auto_package() is intentionally not called.  The generated
+# interfaces still install a rosidl index for livox_ros_driver2, and ROS 2 CLI
+# tools expect a matching package index entry when listing/showing interfaces.
+set(_livox_package_index_file
+    "${CMAKE_CURRENT_BINARY_DIR}/ament_index/resource_index/packages/${PROJECT_NAME}")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/ament_index/resource_index/packages")
+file(WRITE "${_livox_package_index_file}" "")
+install(FILES "${_livox_package_index_file}"
+        DESTINATION share/ament_index/resource_index/packages)
+install(FILES package.xml
+        DESTINATION share/${PROJECT_NAME})
