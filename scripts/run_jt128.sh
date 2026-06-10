@@ -28,6 +28,7 @@ MAP_WAS_PCD=0
 RUN_NAME=""
 WAIT_SECONDS="2"
 SOURCE_SETUP=1
+LOC_BAG_AUTO_START_PAUSED="${JT128_LOC_BAG_AUTO_START_PAUSED:-1}"
 BAG_LIDAR_TOPIC="${DEFAULT_BAG_LIDAR_TOPIC}"
 BAG_IMU_TOPIC="${DEFAULT_BAG_IMU_TOPIC}"
 CONFIG_LIDAR_TOPIC_OVERRIDE="${JT128_LIDAR_TOPIC:-}"
@@ -197,6 +198,10 @@ Options:
       --no-auto-bag-topics
                       Do not generate a temporary config for detected bag topics.
       --wait SEC      Delay before ros2 bag play in *-bag modes. Default: 2
+      --no-start-paused
+                      In loc-bag RViz mode, do not auto-add ros2 bag play
+                      --start-paused. Use only when the initial pose is already
+                      handled or losing the first bag messages is acceptable.
       --no-source     Do not source ROS/workspace setup files.
   -h, --help          Show this help.
 
@@ -857,6 +862,10 @@ configure_loc_bag_manual_init_playback() {
 
     case "${auto_start}" in
         false|False|FALSE|0)
+            if [[ "${LOC_BAG_AUTO_START_PAUSED}" -eq 0 ]]; then
+                note "loc-bag uses RViz initial pose, but auto start-paused is disabled"
+                return 0
+            fi
             if ! bag_play_arg_present "--start-paused" && ! bag_play_arg_present "-p"; then
                 BAG_PLAY_ARGS=(--start-paused "${BAG_PLAY_ARGS[@]}")
                 note "loc-bag uses RViz initial pose; ros2 bag play will start paused"
@@ -1361,6 +1370,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-auto-bag-topics)
             AUTO_BAG_TOPIC_OVERRIDE=0
+            shift
+            ;;
+        --no-start-paused|--no-pause)
+            LOC_BAG_AUTO_START_PAUSED=0
             shift
             ;;
         --no-source)
